@@ -1,10 +1,13 @@
 """A local forwarder in front of Venus (http://v2.open.venus.oa.com/llmproxy) for clients that cannot set request
 headers, such as CodeBuddy's custom models (~/.codebuddy/models.json sends only Content-Type and Authorization).
 Point their url at http://127.0.0.1:18901/llmproxy and each request goes on to Venus with:
-- Venus-Sticky-Routing: token, so one key keeps landing on one upstream and its prompt cache stays warm;
-- for Claude models, Anthropic cache_control on the system prompt, the last tool and the last message (Venus caches
-  Claude only when asked; same places as DeepSeek Harness' cacheControlFormat: anthropic).
-Everything else (path, auth, body, streamed answer) passes through as is. Only 127.0.0.1 can reach it.
+- a routing header that keeps a conversation on one upstream, so its prompt cache stays warm: Venus-Session-Id from
+  CodeBuddy's X-Conversation-Id, else Venus-Sticky-Routing: token;
+- for Claude models, the native Anthropic endpoint (claude_native.py): adaptive thinking at the request's
+  reasoning_effort, signed thinking carried back into later turns, tidier history, cache breakpoints. Venus' OpenAI
+  endpoint, which Claude hardly thinks through, stays as the fallback (VENUS_PROXY_CLAUDE_NATIVE=0 or a 400);
+- other models pass through as they are.
+Only 127.0.0.1 can reach it.
 
 It also guards against Venus going quiet or breaking off mid-answer:
 - one log line per request: status, timings, longest silence, finish_reason, [DONE], usage, and how it ended;
@@ -25,8 +28,14 @@ import sys
 import time
 import urllib.parse
 
+import claude_native
+
 UPSTREAM = os.environ.get("VENUS_PROXY_UPSTREAM", "http://v2.open.venus.oa.com")
 PORT = int(os.environ.get("VENUS_PROXY_PORT", "18901"))
+CLAUDE_NATIVE = os.environ.get("VENUS_PROXY_CLAUDE_NATIVE", "1") != "0"
+CLAUDE_EFFORT = os.environ.get("VENUS_PROXY_CLAUDE_EFFORT") or None  # overrides the request's reasoning_effort
+ROUTING = os.environ.get("VENUS_PROXY_ROUTING", "session")  # session: per conversation; token: per API key
+THOUGHTS = claude_native.Thoughts()
 # Longest wait for Venus' next byte. Under CodeBuddy's 300 s tool-call timer (which starts at the tool name, when Venus
 # goes quiet while it buffers the arguments), above the ~2.5 s per KB of arguments that buffering takes.
 STALL = float(os.environ.get("VENUS_PROXY_STALL", "270"))
@@ -35,6 +44,7 @@ KEEP_FAILED = int(os.environ.get("VENUS_PROXY_KEEP_FAILED", "5"))  # bodies of t
 FAILED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "failed")
 RETRY_STATUS = {429, 502, 503, 504}
 RETRY_WAIT = 2.0
+FALLBACK_STATUS = {400, 404, 422}  # the native request was refused as such: the next plan may still be taken
 CACHE = {"type": "ephemeral"}
 # hop-by-hop or recomputed here: not passed on in either direction
 SKIP = {"host", "connection", "keep-alive", "proxy-connection", "transfer-encoding", "content-length", "upgrade", "te", "trailer"}
@@ -165,36 +175,76 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _forward(self):
         rid, t0 = next(_ids), time.monotonic()
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
-        marked = False
-        if self.command == "POST" and self.path.split("?")[0].endswith("/chat/completions"):
-            new = add_cache(body)
-            marked, body = new is not body, new
         try:
-            model = str(json.loads(body).get("model", "-"))
-        except (ValueError, AttributeError):
-            model = "-"
+            req = json.loads(body)
+        except ValueError:
+            req = None
+        req = req if isinstance(req, dict) else {}
+        model = str(req.get("model", "-"))
         headers = {k: v for k, v in self.headers.items() if k.lower() not in SKIP}
-        if not any(k.lower() in ("venus-session-id", "venus-sticky-routing") for k in headers):
-            headers["Venus-Sticky-Routing"] = "token"
-        info = {"status": "-", "ttfb": None, "gap": 0.0, "end": "ok", "retried": None}
-        watch = None
-        try:
-            conn, resp = self._open(body, headers, info)
-        except (OSError, http.client.HTTPException) as e:
-            info["end"] = f"no_answer:{type(e).__name__}"
-            self._error(502, f"本机 Venus 转发连不上 {UPSTREAM}（重试过一次）：{e}")
-        else:
+        info = {"status": "-", "ttfb": None, "gap": 0.0, "end": "ok", "retried": None, "route": self._route(headers),
+                "api": "pass", "fallback": None, "turns": None}
+        chat = self.command == "POST" and self.path.split("?")[0].endswith("/chat/completions")
+        plans = [("pass", self.path, body, headers, None)]  # what to try, in order: a 400 on one moves on to the next
+        if chat and "claude" in model.lower():
+            plans = [("compat", self.path, add_cache(body), headers, None)]
+            if CLAUDE_NATIVE:
+                path = self.path.split("?")[0][: -len("/chat/completions")] + "/anthropic/v1/messages"
+                nh = {**{k: v for k, v in headers.items() if k.lower() not in ("accept-encoding", "content-type")},
+                      "Content-Type": "application/json", "Accept-Encoding": "identity", "anthropic-version": "2023-06-01"}
+                native, turns = claude_native.to_anthropic(req, THOUGHTS, CLAUDE_EFFORT)
+                first = [("native", path, json.dumps(native, ensure_ascii=False).encode(), nh, turns)]
+                if turns["restored"]:  # a carried-back signature Venus will not take must not break the conversation
+                    plain, t2 = claude_native.to_anthropic(req, claude_native.Thoughts(0), CLAUDE_EFFORT)
+                    first.append(("native_unrestored", path, json.dumps(plain, ensure_ascii=False).encode(), nh, t2))
+                plans = first + plans
+        conn = resp = None
+        for i, (api, path, data, hdrs, turns) in enumerate(plans):
             try:
-                watch = self._relay(resp, info, t0)
+                conn, resp = self._open(path, data, hdrs, info)
+            except (OSError, http.client.HTTPException) as e:
+                info["end"] = f"no_answer:{type(e).__name__}"
+                break  # Venus cannot be reached: another endpoint will not help
+            if resp.status in FALLBACK_STATUS and i + 1 < len(plans):
+                err = claude_native._error(resp.read(), resp.status)["error"]["message"]
+                info["fallback"] = f"{api}:{resp.status}:" + "_".join(str(err).split())[:120]
+                conn.close()
+                conn = resp = None
+                continue
+            info["api"], info["turns"] = api, turns
+            break
+        watch = None
+        if resp is None:
+            if info["end"] == "ok":
+                info["end"] = "no_answer"
+            self._error(502, f"本机 Venus 转发连不上 {UPSTREAM}（重试过一次）：{info['end']}")
+        else:
+            answer = None
+            if info["api"].startswith("native"):
+                answer = claude_native.Answer(model, req.get("stream"), resp.status,
+                                              "text/event-stream" in (resp.getheader("Content-Type") or ""), THOUGHTS)
+            try:
+                watch = self._relay(resp, info, t0, answer)
             finally:
                 resp.close()
                 resp.sock.close()
                 conn.close()  # also stops Venus generating for a client that has gone
-        self._summary(rid, t0, model, body, marked, info, watch)
+        self._summary(rid, t0, model, body, info, watch)
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = _forward
 
-    def _open(self, body, headers, info):
+    def _route(self, headers):
+        """Adds the header that keeps requests on one Venus upstream (whose prompt cache they share); returns which."""
+        if any(k.lower() in ("venus-session-id", "venus-sticky-routing") for k in headers):
+            return "own"
+        conv = self.headers.get("X-Conversation-Id")
+        if ROUTING == "session" and conv:
+            headers["Venus-Session-Id"] = conv
+            return "session"
+        headers["Venus-Sticky-Routing"] = "token"
+        return "token"
+
+    def _open(self, path, body, headers, info):
         """Connection and response from Venus, retried once when Venus could not take the request. Nothing has been sent
         to the client yet, so the retry cannot duplicate part of an answer."""
         up = urllib.parse.urlsplit(UPSTREAM)
@@ -202,7 +252,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for attempt in (1, 2):
             conn = cls(up.netloc, timeout=ANSWER_TIMEOUT)
             try:
-                conn.request(self.command, self.path, body=body or None, headers={**headers, "Content-Length": str(len(body))})
+                conn.request(self.command, path, body=body or None, headers={**headers, "Content-Length": str(len(body))})
                 sock = conn.sock  # getresponse() drops conn.sock when Venus will close the connection after the answer
                 resp = conn.getresponse()
                 resp.sock = sock
@@ -218,17 +268,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn.close()
             time.sleep(RETRY_WAIT)
 
-    def _relay(self, resp, info, t0):
+    def _relay(self, resp, info, t0, answer=None):
+        """Sends Venus' answer on as it arrives; through `answer` (claude_native.Answer) when it must be translated."""
         info["status"], info["ttfb"] = resp.status, time.monotonic() - t0
-        sse = "text/event-stream" in (resp.getheader("Content-Type") or "")
-        if sse:
+        up_sse = "text/event-stream" in (resp.getheader("Content-Type") or "")
+        sse = answer.want_sse if answer else up_sse
+        if up_sse:
             resp.sock.settimeout(STALL)
         watch = Watch(sse)
         try:
             self.send_response(resp.status, resp.reason)
             for k, v in resp.getheaders():
-                if k.lower() not in SKIP:
+                if k.lower() not in SKIP and not (answer and k.lower() in ("content-type", "content-encoding")):
                     self.send_header(k, v)
+            if answer:
+                self.send_header("Content-Type", answer.content_type)
             self.send_header("Transfer-Encoding", "chunked")  # streamed answers (SSE) go out as they arrive
             self.end_headers()
             last = time.monotonic()
@@ -242,12 +296,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     info["end"] = f"upstream_error:{type(e).__name__}"
                     break
                 now = time.monotonic()
-                info["gap"], last = max(info["gap"], now - last), now
                 if not chunk:
                     break
-                watch.feed(chunk)
-                self._chunk(chunk)
+                out = answer.feed(chunk) if answer else chunk
+                if out:
+                    info["gap"], last = max(info["gap"], now - last), now
+                    watch.feed(out)
+                    self._chunk(out)
+                elif up_sse and now - last > STALL:  # Venus' pings keep the socket busy, but nothing is being said
+                    info["end"] = "stalled"
+                    break
             info["gap"] = max(info["gap"], time.monotonic() - last)
+            if answer and info["end"] == "ok":
+                out = answer.close()
+                if out:
+                    watch.feed(out)
+                    self._chunk(out)
             watch.close()
             if sse and resp.status == 200 and not watch.complete:
                 if info["end"] == "ok":
@@ -281,9 +345,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             self.close_connection = True
 
-    def _summary(self, rid, t0, model, body, marked, info, watch):
+    def _summary(self, rid, t0, model, body, info, watch):
         status = info["status"]
-        out = [f"#{rid}", self.command, self.path, f"model={model}", f"req={len(body)}B", f"status={status}"]
+        out = [f"#{rid}", self.command, self.path, f"model={model}", f"api={info['api']}", f"route={info['route']}",
+               f"req={len(body)}B", f"status={status}"]
+        if info["fallback"]:
+            out.append(f"fallback={info['fallback']}")
+        if info["turns"]:
+            out.append(f"thinking_restored={info['turns']['restored']}/{info['turns']['turns']}")
         if info["retried"]:
             out.append(f"retried={info['retried']}")
         if info["ttfb"] is not None:
@@ -295,14 +364,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 u = watch.usage
                 d = u.get("prompt_tokens_details") or {}
                 out.append(f"usage=in:{u.get('prompt_tokens', '-')},read:{d.get('cache_read_tokens', d.get('cached_tokens', '-'))},"
-                           f"write:{d.get('cache_creation_tokens', '-')},out:{u.get('completion_tokens', '-')}")
+                           f"write:{d.get('cache_creation_tokens', '-')},out:{u.get('completion_tokens', '-')}"
+                           f"{',think:' + str(u['completion_tokens_details'].get('reasoning_tokens')) if isinstance(u.get('completion_tokens_details'), dict) else ''}")
             err = watch.error
             if err is None and isinstance(status, int) and status >= 400:
                 err = watch.buf[:300].decode("utf-8", "replace")
             if err:
                 out.append("err=" + " ".join(str(err.get("message", err) if isinstance(err, dict) else err).split())[:200])
-        if marked:
-            out.append("cache_control=added")
         out.append(f"end={info['end']}")
         if info["end"] not in ("ok", "client_gone") or (isinstance(status, int) and status >= 500):
             saved = _keep_failed(rid, body)
@@ -323,8 +391,8 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"Venus 转发：http://127.0.0.1:{PORT} -> {UPSTREAM}（Venus-Sticky-Routing: token，Claude 加 cache_control，"
-          f"{STALL:g} 秒无输出即中止）", flush=True)
+    print(f"Venus 转发：http://127.0.0.1:{PORT} -> {UPSTREAM}（路由 {ROUTING}，Claude 走"
+          f"{'原生接口、思考 ' + (CLAUDE_EFFORT or '跟随请求') if CLAUDE_NATIVE else '兼容接口'}，{STALL:g} 秒无输出即中止）", flush=True)
     Server(("127.0.0.1", PORT), Handler).serve_forever()
 
 
