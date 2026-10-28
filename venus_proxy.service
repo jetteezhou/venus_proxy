@@ -1,0 +1,16 @@
+[Unit]
+Description=Local forwarder in front of Venus (venus_proxy.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 DIR/venus_proxy.py
+WorkingDirectory=DIR
+Restart=always
+RestartSec=5
+StandardOutput=append:DIR/proxy.log
+StandardError=append:DIR/proxy.log
+
+[Install]
+WantedBy=multi-user.target

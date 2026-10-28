@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Keeps the local Venus forwarder (venus_proxy.py) on 127.0.0.1:18901 running. DIR is replaced by install.sh. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.venus.proxy</string>
+  <key>ProgramArguments</key>
+  <array><string>/usr/bin/env</string><string>python3</string><string>DIR/venus_proxy.py</string></array>
+  <key>WorkingDirectory</key><string>DIR</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>15</integer>
+  <key>StandardOutPath</key><string>DIR/proxy.log</string>
+  <key>StandardErrorPath</key><string>DIR/proxy.log</string>
+</dict>
+</plist>
