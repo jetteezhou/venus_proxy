@@ -6,6 +6,9 @@ Point their url at http://127.0.0.1:18901/llmproxy and each request goes on to V
 - for Claude models, the native Anthropic endpoint (claude_native.py): adaptive thinking at the request's
   reasoning_effort, signed thinking carried back into later turns, tidier history, cache breakpoints. Venus' OpenAI
   endpoint, which Claude hardly thinks through, stays as the fallback (VENUS_PROXY_CLAUDE_NATIVE=0 or a 400);
+- for GPT-5 and later, Venus' Responses endpoint (openai_responses.py): on /chat/completions they refuse tools together
+  with reasoning_effort. Encrypted reasoning is carried back, prompt_cache_key is the conversation. /chat/completions
+  stays as the fallback (VENUS_PROXY_GPT_RESPONSES=0 or a 400);
 - other models pass through as they are.
 Only 127.0.0.1 can reach it.
 
@@ -23,19 +26,24 @@ import http.server
 import itertools
 import json
 import os
+import re
 import socketserver
 import sys
 import time
 import urllib.parse
 
 import claude_native
+import openai_responses
 
 UPSTREAM = os.environ.get("VENUS_PROXY_UPSTREAM", "http://v2.open.venus.oa.com")
 PORT = int(os.environ.get("VENUS_PROXY_PORT", "18901"))
 CLAUDE_NATIVE = os.environ.get("VENUS_PROXY_CLAUDE_NATIVE", "1") != "0"
 CLAUDE_EFFORT = os.environ.get("VENUS_PROXY_CLAUDE_EFFORT") or None  # overrides the request's reasoning_effort
+GPT_RESPONSES = os.environ.get("VENUS_PROXY_GPT_RESPONSES", "1") != "0"
+GPT_MODEL = re.compile(r"gpt-[5-9]")  # these refuse tools with reasoning_effort on /chat/completions
 ROUTING = os.environ.get("VENUS_PROXY_ROUTING", "session")  # session: per conversation; token: per API key
 THOUGHTS = claude_native.Thoughts()
+REASONING = claude_native.Thoughts()  # GPT's encrypted reasoning; apart, so a model switch never mixes the two
 # Longest wait for Venus' next byte. Under CodeBuddy's 300 s tool-call timer (which starts at the tool name, when Venus
 # goes quiet while it buffers the arguments), above the ~2.5 s per KB of arguments that buffering takes.
 STALL = float(os.environ.get("VENUS_PROXY_STALL", "270"))
@@ -198,6 +206,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     plain, t2 = claude_native.to_anthropic(req, claude_native.Thoughts(0), CLAUDE_EFFORT)
                     first.append(("native_unrestored", path, json.dumps(plain, ensure_ascii=False).encode(), nh, t2))
                 plans = first + plans
+        elif chat and GPT_RESPONSES and GPT_MODEL.match(model.lower()):
+            path = self.path.split("?")[0][: -len("/chat/completions")] + "/v1/responses"
+            rh = {**{k: v for k, v in headers.items() if k.lower() not in ("accept-encoding", "content-type")},
+                  "Content-Type": "application/json", "Accept-Encoding": "identity"}
+            conv = self.headers.get("X-Conversation-Id")
+            first, turns = openai_responses.to_responses(req, REASONING, conv)
+            plans = [("responses", path, json.dumps(first, ensure_ascii=False).encode(), rh, turns)] + plans
+            if turns["restored"]:  # reasoning is encrypted per Venus backend: another one cannot read it
+                plain, t2 = openai_responses.to_responses(req, claude_native.Thoughts(0), conv)
+                plans.insert(1, ("responses_unrestored", path, json.dumps(plain, ensure_ascii=False).encode(), rh, t2))
         conn = resp = None
         for i, (api, path, data, hdrs, turns) in enumerate(plans):
             try:
@@ -219,16 +237,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 info["end"] = "no_answer"
             self._error(502, f"本机 Venus 转发连不上 {UPSTREAM}（重试过一次）：{info['end']}")
         else:
-            answer = None
+            answer, up_sse = None, "text/event-stream" in (resp.getheader("Content-Type") or "")
             if info["api"].startswith("native"):
-                answer = claude_native.Answer(model, req.get("stream"), resp.status,
-                                              "text/event-stream" in (resp.getheader("Content-Type") or ""), THOUGHTS)
+                answer = claude_native.Answer(model, req.get("stream"), resp.status, up_sse, THOUGHTS)
+            elif info["api"].startswith("responses"):
+                answer = openai_responses.Answer(model, req.get("stream"), resp.status, up_sse, REASONING)
             try:
                 watch = self._relay(resp, info, t0, answer)
             finally:
                 resp.close()
                 resp.sock.close()
                 conn.close()  # also stops Venus generating for a client that has gone
+            if answer and answer.id.startswith("msg_"):  # Claude's message id tells Venus' backend: msg_bdrk_.. Bedrock
+                info["backend"] = answer.id.split("_")[1] if answer.id.count("_") > 1 else "anthropic"
         self._summary(rid, t0, model, body, info, watch)
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = _forward
@@ -353,6 +374,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             out.append(f"fallback={info['fallback']}")
         if info["turns"]:
             out.append(f"thinking_restored={info['turns']['restored']}/{info['turns']['turns']}")
+        if info.get("backend"):
+            out.append(f"backend={info['backend']}")
         if info["retried"]:
             out.append(f"retried={info['retried']}")
         if info["ttfb"] is not None:
@@ -392,7 +415,8 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def main():
     print(f"Venus 转发：http://127.0.0.1:{PORT} -> {UPSTREAM}（路由 {ROUTING}，Claude 走"
-          f"{'原生接口、思考 ' + (CLAUDE_EFFORT or '跟随请求') if CLAUDE_NATIVE else '兼容接口'}，{STALL:g} 秒无输出即中止）", flush=True)
+          f"{'原生接口、思考 ' + (CLAUDE_EFFORT or '跟随请求') if CLAUDE_NATIVE else '兼容接口'}，"
+          f"GPT-5+ 走{'Responses 接口' if GPT_RESPONSES else '兼容接口'}，{STALL:g} 秒无输出即中止）", flush=True)
     Server(("127.0.0.1", PORT), Handler).serve_forever()
 
 

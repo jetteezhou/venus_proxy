@@ -4,6 +4,7 @@ CodeBuddy 自定义模型（`~/.codebuddy/models.json`）发出的请求只带 `
 
 ```
 CodeBuddy ──> http://127.0.0.1:18901/llmproxy/chat/completions ─┬─ Claude ──> /llmproxy/anthropic/v1/messages（原生接口，思考打开）
+                                                                ├─ GPT-5 及以后 ──> /llmproxy/v1/responses（Responses 接口）
                                                                 └─ 其他 ──> /llmproxy/chat/completions（原样转发）
 ```
 
@@ -19,8 +20,9 @@ CodeBuddy ──> http://127.0.0.1:18901/llmproxy/chat/completions ─┬─ Cla
 8. **Venus 卡住时主动中止**：流式回复超过 `VENUS_PROXY_STALL`（默认 270 秒）没有任何内容（原生接口的 `ping` 不算），就不再等了。
 9. **流断了就明说**：流式回复没有 `finish_reason` 也没有 `[DONE]` 就结束了，转发会在流末尾补一个 `data: {"error": {...}}` 事件。CodeBuddy 收到后按“出错”处理，而不是把半截回复当成正常结束。
 10. **留下失败请求的请求体**：上面这几种失败，CodeBuddy 发来的原始请求体会存到 `failed/`（权限 0600，只保留最近 5 个），方便直接拿去重放。只存请求体，不含 API key，但有完整对话内容。
+11. **GPT-5 及以后走 Responses 接口**：model 名匹配 `gpt-5`～`gpt-9` 开头的请求（如 `gpt-6-sol`、`gpt-6.1-sol`），翻译成 Responses 格式发给 `/llmproxy/v1/responses`，回复再翻译回 OpenAI chat 格式。原因：这些模型在 `/chat/completions` 上**不接受工具和 `reasoning_effort` 同时出现**（`Function tools with reasoning_effort are not supported ... use /v1/responses`），而 CodeBuddy 每次都两样都带。同时：`reasoning.effort` 取请求的 `reasoning_effort`（`max` 映射成 `xhigh`），思考摘要放进 `reasoning_content`；加密的推理项（`store: false` + `reasoning.encrypted_content`）记下来，下一轮放回原处（和 Codex 一样）；`prompt_cache_key` 设成对话 id，提高缓存命中。加密推理只有签发它的 Venus 后端能解，被拒（400）时先去掉推理再试，还不行就退回 `/chat/completions`。
 
-GPT、Kimi、DeepSeek 等模型原样转发，它们的缓存是自动的，有了第 1 条的粘性路由就够了。
+Kimi、DeepSeek、GPT-4 等模型原样转发，它们的缓存是自动的，有了第 1 条的粘性路由就够了。
 
 转发只监听 `127.0.0.1`，别的机器连不上。它不保存也不打印 API key。
 
@@ -40,6 +42,7 @@ Cursor 走的就是原生接口，并且会回传思考。同一个模型在 Cod
 |---|---|
 | `venus_proxy.py` | 转发程序 |
 | `claude_native.py` | OpenAI ↔ Anthropic 格式翻译、思考块的记忆 |
+| `openai_responses.py` | OpenAI chat ↔ Responses 格式翻译（GPT-5 及以后） |
 | `test_venus_proxy.py` | 测试 |
 | `venus_proxy.service` | Linux systemd 配置模板（里面的 `DIR` 安装时替换成实际路径） |
 | `com.venus.proxy.plist` | macOS launchd 配置模板（里面的 `DIR` 由 `install.sh` 替换成实际路径） |
@@ -92,10 +95,11 @@ CodeBuddy 会自己在后面加 `/chat/completions`。其他字段（`apiKey` �
 
 | 字段 | 含义 |
 |---|---|
-| `api` | `native` Claude 原生接口；`native_unrestored` 原生接口但去掉了带回的思考；`compat` Claude 走兼容接口；`pass` 其他模型原样转发 |
+| `api` | `native` Claude 原生接口；`native_unrestored` 原生接口但去掉了带回的思考；`compat` Claude 走兼容接口；`responses` / `responses_unrestored` GPT 走 Responses 接口（后者去掉了带回的推理）；`pass` 原样转发 |
 | `route` | 粘性路由方式：`session`（按对话）、`token`（按 key）、`own`（请求自带） |
 | `fallback` | 原生接口被拒、退回下一种方式的原因 |
 | `thinking_restored` | 历史里有几轮助手回复被补回了思考 / 一共几轮。转发重启后、或这轮回复不是经转发原生接口生成的，补不回 |
+| `backend` | Claude 这次落在 Venus 哪个后端（从消息 id 看出）：`anthropic` 直连、`bdrk` Bedrock、`vrtx` Vertex。各后端缓存互不相通，见“缓存为什么常常没命中” |
 | `req` / `resp` | 请求体 / 回复的字节数 |
 | `retried` | 重试过一次，以及第一次失败的原因（状态码或异常名） |
 | `ttfb` / `dur` | 收到 Venus 响应头用的时间 / 整个请求用的时间 |
@@ -131,6 +135,25 @@ curl -sN http://v2.open.venus.oa.com/llmproxy/chat/completions -H "Authorization
   -H 'Content-Type: application/json' -H 'Venus-Sticky-Routing: token' -d @$HOME/.venus_proxy/failed/<文件名>.json | tail -5
 ```
 
+## 缓存为什么常常没命中（2026-10-31 查的）
+
+把 `proxy.log` 里 10-28～10-31 的 Claude 请求按“上一轮之后多久发出”分开统计：
+
+- 间隔超过 5 分钟（Anthropic 缓存的 TTL）：约 90% 未命中，这是 TTL 到期，正常。
+- 间隔不到 5 分钟：约 20% 未命中，原生接口（按对话路由）和以前的兼容接口（按 key 路由）一样。整段几十万 token 重新按 1.25 倍写入缓存，写入费用主要就花在这里。
+
+这 20% 不是请求的前缀变了：对比 `failed/` 里同一对话前后两次请求，CodeBuddy 发来的历史逐条一致，工具和系统提示也没变，转发补回的思考块数也只增不减。日志的规律是“一次未命中、下一次正好命中它刚写的缓存”，有时候读到的是好几轮之前的前缀，也就是说，同一个对话被 Venus 分到了缓存互不相通的不同后端。实测 Venus 的 Claude 后端至少有 Anthropic 直连（消息 id `msg_01…`）和 Bedrock（`msg_bdrk_…`）两个。单独连发同一个请求时，按 session 和按 token 都能稳定命中，所以后端切换多半发生在 Venus 负载高、某个后端报错时（这段时间也偶尔能看到 Venus 直接回 502）。
+
+转发没法指定后端，只能记录：日志里的 `backend=` 字段记的就是每次落在哪个后端。核对办法：
+
+```sh
+grep 'api=native' ~/.venus_proxy/proxy.log | grep -oE 'backend=[^ ]+|usage=in:[0-9]+,read:[0-9]+' | paste - - | tail -40
+```
+
+如果未命中正好落在 `backend` 变化的那一次，就能确认是 Venus 侧的问题，要找 Venus 的同学按会话固定后端。1 小时 TTL 的缓存帮不上忙：写入按 2 倍计价，按现在的未命中比例算反而更贵。
+
+GPT 走 Responses 接口时，`prompt_cache_key` 设成对话 id，实测同一对话第二轮起就能命中前缀（`read=` 接近 `in=`）。
+
 ## 为什么 STALL 默认 270 秒
 
 CodeBuddy 给每个工具调用设了 300 秒的计时：从收到工具名开始算，300 秒内参数还没收全，就取消这个工具调用，提示 `Your response ended with finish reason "unknown" before completing this tool call; please regenerate.`。这时它会把整个回复当成“正常结束”，不重试，也不报错。
@@ -159,6 +182,7 @@ cd ~/.venus_proxy && python3 -m unittest -v test_venus_proxy   # 跑测试
 | `VENUS_PROXY_KEEP_FAILED` | `5` | 保留最近几次失败请求的请求体，`0` 不保留 |
 | `VENUS_PROXY_CLAUDE_NATIVE` | `1` | `0`：Claude 改回走兼容接口（只加 `cache_control`），即以前的行为 |
 | `VENUS_PROXY_CLAUDE_EFFORT` | 跟随请求 | 强制 Claude 的思考档位：`low` / `medium` / `high` / `xhigh` / `max`，`none` 关闭思考 |
+| `VENUS_PROXY_GPT_RESPONSES` | `1` | `0`：GPT-5 及以后改回原样走 `/chat/completions`（带工具时会被 Venus 拒绝） |
 | `VENUS_PROXY_ROUTING` | `session` | `token`：全部按 API key 粘性路由，即以前的行为 |
 
 Linux 上写进 `/etc/systemd/system/venus-proxy.service` 的 `[Service]`（如 `Environment=VENUS_PROXY_STALL=200`），然后 `systemctl daemon-reload && systemctl restart venus-proxy`。macOS 上写进 plist 的 `EnvironmentVariables`，然后重新运行 `install.sh`。

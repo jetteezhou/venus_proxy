@@ -17,6 +17,7 @@ from unittest import mock
 
 import venus_proxy as vp
 import claude_native as cn
+import openai_responses as opr
 
 C = {"type": "ephemeral"}
 DONE = b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":2,' \
@@ -119,7 +120,7 @@ class Harness(unittest.TestCase):
         self.log = io.StringIO()
         for p in (mock.patch.object(vp, "UPSTREAM", f"http://127.0.0.1:{self.up.server_port}"), mock.patch.object(vp, "RETRY_WAIT", 0),
                   mock.patch.object(vp, "FAILED_DIR", self.failed.name), mock.patch.object(vp, "CLAUDE_NATIVE", self.native),
-                  mock.patch.object(vp, "THOUGHTS", cn.Thoughts()), redirect_stderr(self.log)):
+                  mock.patch.object(vp, "THOUGHTS", cn.Thoughts()), mock.patch.object(vp, "REASONING", cn.Thoughts()), redirect_stderr(self.log)):
             p.__enter__()
             self.addCleanup(p.__exit__, None, None, None)
 
@@ -458,6 +459,124 @@ class NativeForward(Harness):
         self.post(body=self.body(model="kimi-k3.1-pro"))
         self.assertEqual(Upstream.seen[0]["path"], "/llmproxy/chat/completions")
         self.assertIn("api=pass", self.line())
+
+    def test_backend_is_read_from_the_message_id(self):
+        Upstream.script = [(200, "text/event-stream", [NATIVE_TOOL[0].replace(b"msg_1", b"msg_bdrk_01x")] + NATIVE_TOOL[1:])]
+        self.post(body=self.body())
+        self.assertIn("backend=bdrk", self.line())
+
+
+def rev(kind, **kw):
+    return b"event: " + kind.encode() + b"\ndata: " + json.dumps({"type": kind, **kw}).encode() + b"\n\n"
+
+
+ENC = "gAAAAenc"
+RS = {"id": "rs_1", "type": "reasoning", "summary": [{"type": "summary_text", "text": "想"}], "encrypted_content": ENC}
+FC = {"id": "fc_1", "type": "function_call", "name": "run", "arguments": "{\"cmd\":\"ls\"}", "call_id": "call_A"}
+RESP_TOOL = [  # Venus' Responses stream, as recorded from it (gpt-6-sol)
+    rev("response.created", response={"id": "resp_1", "status": "in_progress", "output": []}),
+    rev("response.output_item.added", output_index=0, item={**RS, "summary": []}),
+    rev("response.reasoning_summary_part.added", output_index=0, summary_index=0),
+    rev("response.reasoning_summary_text.delta", output_index=0, summary_index=0, delta="想"),
+    rev("response.output_item.done", output_index=0, item=RS),
+    rev("response.output_item.added", output_index=1, item={"id": "msg_1", "type": "message", "content": []}),
+    rev("response.output_text.delta", output_index=1, delta="看一下"),
+    rev("response.output_item.added", output_index=2, item={**FC, "arguments": ""}),
+    rev("response.function_call_arguments.delta", output_index=2, delta="{\"cmd\":"),
+    rev("response.function_call_arguments.delta", output_index=2, delta="\"ls\"}"),
+    rev("response.output_item.done", output_index=2, item=FC),
+    rev("response.completed", response={"id": "resp_1", "status": "completed", "output": [
+        RS, {"id": "msg_1", "type": "message", "content": [{"type": "output_text", "text": "看一下"}]}, FC],
+        "usage": {"input_tokens": 50, "input_tokens_details": {"cached_tokens": 40}, "output_tokens": 9,
+                  "output_tokens_details": {"reasoning_tokens": 6}}})]
+
+
+class Responses(unittest.TestCase):
+    def test_codebuddy_request_becomes_a_responses_one(self):
+        req = {"model": "gpt-6-sol", "max_tokens": 128000, "reasoning_effort": "high", "stream": True, "tool_choice": "auto",
+               "tools": TOOLS, "temperature": 0.2, "messages": [
+                   {"role": "system", "content": "规则"},
+                   {"role": "user", "content": [{"type": "text", "text": "看图"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]},
+                   {"role": "assistant", "content": "-", "tool_calls": [{"id": "call_A", "type": "function", "function": {"name": "run", "arguments": "{}"}}]},
+                   {"role": "tool", "tool_call_id": "call_A", "content": "out"}, {"role": "assistant", "content": "好"}, {"role": "user", "content": "继续"}]}
+        body, turns = opr.to_responses(req, cn.Thoughts(), "c1")
+        self.assertEqual(body["input"], [
+            {"role": "system", "content": "规则"},
+            {"role": "user", "content": [{"type": "input_text", "text": "看图"}, {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]},
+            {"type": "function_call", "call_id": "call_A", "name": "run", "arguments": "{}"},  # "-" dropped
+            {"type": "function_call_output", "call_id": "call_A", "output": "out"},
+            {"role": "assistant", "content": "好"}, {"role": "user", "content": "继续"}])
+        self.assertEqual(body["tools"], [{"type": "function", "name": "run", "description": "d", "strict": False, "parameters": TOOLS[0]["function"]["parameters"]}])
+        self.assertEqual((body["reasoning"], body["max_output_tokens"], body["prompt_cache_key"], body["store"], body["stream"], body["tool_choice"]),
+                         ({"effort": "high", "summary": "auto"}, 128000, "c1", False, True, "auto"))
+        self.assertNotIn("temperature", body)
+        self.assertEqual(turns, {"turns": 2, "restored": 0})
+
+    def test_stream_becomes_chunks_and_reasoning_goes_back_into_its_turn(self):
+        th = cn.Thoughts()
+        a = opr.Answer("gpt-6-sol", True, 200, True, th)
+        raw = b"".join(RESP_TOOL)
+        out = b"".join(a.feed(raw[i:i + 11]) for i in range(0, len(raw), 11)) + a.close()
+        cs = chunks(out)
+        deltas = [c["choices"][0]["delta"] for c in cs]
+        self.assertEqual("".join(d.get("reasoning_content", "") for d in deltas), "想")
+        self.assertEqual("".join(d.get("content", "") for d in deltas), "看一下")
+        tc = [t for d in deltas for t in d.get("tool_calls", [])]
+        self.assertEqual((tc[0]["id"], tc[0]["function"]["name"], "".join(t["function"]["arguments"] for t in tc)), ("call_A", "run", "{\"cmd\":\"ls\"}"))
+        self.assertEqual((cs[-1]["choices"][0]["finish_reason"], cs[-1]["usage"]["prompt_tokens_details"]["cached_tokens"], cs[-1]["id"]),
+                         ("tool_calls", 40, "resp_1"))
+        self.assertTrue(out.endswith(b"data: [DONE]\n\n"))
+        req = {"model": "gpt-6-sol", "messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": "看一下", "tool_calls": [
+            {"id": "call_A", "function": {"name": "run", "arguments": "{\"cmd\":\"ls\"}"}}]}, {"role": "tool", "tool_call_id": "call_A", "content": "a.py"}]}
+        body, turns = opr.to_responses(req, th)
+        self.assertEqual(body["input"][1], {"type": "reasoning", "summary": RS["summary"], "encrypted_content": ENC})  # no id: store=false
+        self.assertEqual(turns, {"turns": 1, "restored": 1})
+
+    def test_json_answer_and_errors(self):
+        d = {"id": "resp_2", "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
+             "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}], "usage": {"input_tokens": 3, "output_tokens": 4}}
+        a = opr.Answer("m", False, 200, False, cn.Thoughts())
+        a.feed(json.dumps(d).encode())
+        got = json.loads(a.close())
+        self.assertEqual((got["choices"][0]["message"], got["choices"][0]["finish_reason"]), ({"role": "assistant", "content": "hi"}, "length"))
+        a = opr.Answer("m", True, 400, False, cn.Thoughts())
+        a.feed(b'{"error":{"message":"bad","type":"invalid_request_error"}}')
+        self.assertEqual(json.loads(a.close())["error"]["message"], "bad")
+        a = opr.Answer("m", True, 200, True, cn.Thoughts())
+        failed = a.feed(rev("response.failed", response={"error": {"code": "server_error", "message": "boom"}}))
+        self.assertEqual(chunks(failed)[0]["error"]["message"], "boom")
+
+
+class ResponsesForward(Harness):
+    def body(self, **kw):
+        return {"model": "gpt-6-sol", "stream": True, "reasoning_effort": "high", "tools": TOOLS, "messages": [{"role": "user", "content": "hi"}], **kw}
+
+    def test_gpt_goes_to_responses_and_comes_back_as_chat(self):
+        Upstream.script = [(200, "text/event-stream", RESP_TOOL)]
+        status, out = self.post(body=self.body(), headers={"X-Conversation-Id": "c9"})
+        seen = Upstream.seen[0]
+        self.assertEqual((status, seen["path"], seen["headers"]["Venus-Session-Id"]), (200, "/llmproxy/v1/responses", "c9"))
+        self.assertEqual(json.loads(seen["body"])["prompt_cache_key"], "c9")
+        self.assertEqual(chunks(out)[-1]["choices"][0]["finish_reason"], "tool_calls")
+        for part in ("api=responses", "finish=tool_calls", "done=yes", "usage=in:50,read:40", "end=ok"):
+            self.assertIn(part, self.line())
+
+    def test_unreadable_reasoning_retries_without_it_then_chat(self):
+        vp.REASONING.put("tool:call_A", [{"type": "reasoning", "summary": [], "encrypted_content": "x"}])
+        hist = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "-", "tool_calls": [{"id": "call_A", "function": {"name": "run", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "call_A", "content": "ok"}]
+        refused = (400, "application/json", [b'{"error":{"message":"invalid encrypted content","type":"invalid_request_error"}}'])
+        Upstream.script = [refused, refused, (200, "text/event-stream", [TEXT, DONE])]
+        self.assertEqual(self.post(body=self.body(messages=hist)), (200, TEXT + DONE))
+        self.assertEqual([s["path"] for s in Upstream.seen], ["/llmproxy/v1/responses"] * 2 + ["/llmproxy/chat/completions"])
+        self.assertEqual([i.get("type") for i in json.loads(Upstream.seen[0]["body"])["input"]][1], "reasoning")
+        self.assertNotIn("reasoning", [i.get("type") for i in json.loads(Upstream.seen[1]["body"])["input"]])
+        self.assertIn("fallback=responses_unrestored:400:invalid_encrypted_content", self.line())
+
+    def test_older_gpt_passes_through(self):
+        Upstream.script = [(200, "text/event-stream", [DONE])]
+        self.post(body=self.body(model="gpt-4o"))
+        self.assertEqual(Upstream.seen[0]["path"], "/llmproxy/chat/completions")
 
 
 if __name__ == "__main__":
