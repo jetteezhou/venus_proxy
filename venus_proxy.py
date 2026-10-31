@@ -14,7 +14,8 @@ Only 127.0.0.1 can reach it.
 
 It also guards against Venus going quiet or breaking off mid-answer:
 - one log line per request: status, timings, longest silence, finish_reason, [DONE], usage, and how it ended;
-- one retry when Venus could not take the request at all (nothing has reached the client, so nothing is duplicated);
+- up to three retries, 5/20/40 s apart, when Venus could not take the request at all (429, 502-504, unreachable;
+  nothing has reached the client, so nothing is duplicated);
 - after STALL seconds without a byte from Venus it gives up, before CodeBuddy's 300 s per-tool-call timer fires;
 - a stream that ends without finish_reason or [DONE] gets an explicit SSE error event, so the client reports a broken
   answer (finish reason "error") instead of taking it for a finished one (finish reason "unknown");
@@ -51,7 +52,7 @@ ANSWER_TIMEOUT = 900  # until Venus' response headers, and between bytes of a no
 KEEP_FAILED = int(os.environ.get("VENUS_PROXY_KEEP_FAILED", "5"))  # bodies of the last N failed requests; 0 keeps none
 FAILED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "failed")
 RETRY_STATUS = {429, 502, 503, 504}
-RETRY_WAIT = 2.0
+RETRY_WAITS = (5, 20, 40)  # seconds before each retry; 65 s in all outlasts Venus' per-minute TPM window
 FALLBACK_STATUS = {400, 404, 422}  # the native request was refused as such: the next plan may still be taken
 CACHE = {"type": "ephemeral"}
 # hop-by-hop or recomputed here: not passed on in either direction
@@ -235,7 +236,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if resp is None:
             if info["end"] == "ok":
                 info["end"] = "no_answer"
-            self._error(502, f"本机 Venus 转发连不上 {UPSTREAM}（重试过一次）：{info['end']}")
+            self._error(502, f"本机 Venus 转发连不上 {UPSTREAM}（重试过 {len(RETRY_WAITS)} 次）：{info['end']}")
         else:
             answer, up_sse = None, "text/event-stream" in (resp.getheader("Content-Type") or "")
             if info["api"].startswith("native"):
@@ -266,11 +267,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return "token"
 
     def _open(self, path, body, headers, info):
-        """Connection and response from Venus, retried once when Venus could not take the request. Nothing has been sent
-        to the client yet, so the retry cannot duplicate part of an answer."""
+        """Connection and response from Venus, retried up to len(RETRY_WAITS) times when Venus could not take the request
+        (429 and the like). Nothing has been sent to the client yet, so a retry cannot duplicate part of an answer."""
         up = urllib.parse.urlsplit(UPSTREAM)
         cls = http.client.HTTPSConnection if up.scheme == "https" else http.client.HTTPConnection
-        for attempt in (1, 2):
+        for attempt in range(len(RETRY_WAITS) + 1):
+            last = attempt == len(RETRY_WAITS)
             conn = cls(up.netloc, timeout=ANSWER_TIMEOUT)
             try:
                 conn.request(self.command, path, body=body or None, headers={**headers, "Content-Length": str(len(body))})
@@ -279,15 +281,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 resp.sock = sock
             except (OSError, http.client.HTTPException) as e:
                 conn.close()
-                if attempt == 2 or isinstance(e, TimeoutError):  # after ANSWER_TIMEOUT Venus may well be working on it
+                if last or isinstance(e, TimeoutError):  # after ANSWER_TIMEOUT Venus may well be working on it
                     raise
-                info["retried"] = type(e).__name__
+                why = type(e).__name__
             else:
-                if attempt == 2 or resp.status not in RETRY_STATUS:
+                if last or resp.status not in RETRY_STATUS:
                     return conn, resp
-                info["retried"] = str(resp.status)
+                why = str(resp.status)
                 conn.close()
-            time.sleep(RETRY_WAIT)
+            info["retried"] = f"{why}*{attempt + 1}"
+            time.sleep(RETRY_WAITS[attempt])
 
     def _relay(self, resp, info, t0, answer=None):
         """Sends Venus' answer on as it arrives; through `answer` (claude_native.Answer) when it must be translated."""

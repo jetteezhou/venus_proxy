@@ -118,7 +118,7 @@ class Harness(unittest.TestCase):
             threading.Thread(target=s.serve_forever, daemon=True).start()
         self.failed = tempfile.TemporaryDirectory()
         self.log = io.StringIO()
-        for p in (mock.patch.object(vp, "UPSTREAM", f"http://127.0.0.1:{self.up.server_port}"), mock.patch.object(vp, "RETRY_WAIT", 0),
+        for p in (mock.patch.object(vp, "UPSTREAM", f"http://127.0.0.1:{self.up.server_port}"), mock.patch.object(vp, "RETRY_WAITS", (0, 0, 0)),
                   mock.patch.object(vp, "FAILED_DIR", self.failed.name), mock.patch.object(vp, "CLAUDE_NATIVE", self.native),
                   mock.patch.object(vp, "THOUGHTS", cn.Thoughts()), mock.patch.object(vp, "REASONING", cn.Thoughts()), redirect_stderr(self.log)):
             p.__enter__()
@@ -207,17 +207,23 @@ class Forward(Harness):
         self.assertEqual(self.post(), (200, own))
         self.assertIn("err=busy", self.line())
 
-    def test_busy_venus_is_retried_once_before_anything_is_sent(self):
+    def test_busy_venus_is_retried_before_anything_is_sent(self):
         Upstream.script = [(503, "application/json", [b'{"error":{"message":"busy"}}']), (200, "text/event-stream", [DONE])]
         self.assertEqual(self.post(), (200, DONE))
         self.assertEqual(len(Upstream.seen), 2)
-        self.assertIn("retried=503", self.line())
+        self.assertIn("retried=503*1", self.line())
 
-    def test_second_failure_is_passed_on_as_is(self):
-        Upstream.script = [(429, "application/json", [b'{"error":{"message":"slow down"}}'])] * 2
+    def test_rate_limit_is_retried_three_times(self):
+        Upstream.script = [(429, "application/json", [b'{"error":{"message":"slow down"}}'])] * 3 + [(200, "text/event-stream", [DONE])]
+        self.assertEqual(self.post(), (200, DONE))
+        self.assertEqual(len(Upstream.seen), 4)
+        self.assertIn("retried=429*3", self.line())
+
+    def test_fourth_failure_is_passed_on_as_is(self):
+        Upstream.script = [(429, "application/json", [b'{"error":{"message":"slow down"}}'])] * 4
         status, body = self.post()
         self.assertEqual((status, json.loads(body)["error"]["message"]), (429, "slow down"))
-        self.assertEqual(len(Upstream.seen), 2)
+        self.assertEqual(len(Upstream.seen), 4)
         self.assertIn("err=slow down", self.line())
 
     def test_client_errors_are_not_retried(self):
@@ -225,16 +231,16 @@ class Forward(Harness):
         self.assertEqual(self.post()[0], 400)
         self.assertEqual(len(Upstream.seen), 1)
 
-    def test_unreachable_venus_gives_502_after_one_retry(self):
+    def test_unreachable_venus_gives_502_after_retries(self):
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
-            dead = s.getsockname()[1]  # bound but never listening: connection refused
-            with mock.patch.object(vp, "UPSTREAM", f"http://127.0.0.1:{dead}"):
-                status, body = self.post()
+            dead = s.getsockname()[1]  # closed again: connection refused (bound but not listening times out on macOS)
+        with mock.patch.object(vp, "UPSTREAM", f"http://127.0.0.1:{dead}"):
+            status, body = self.post()
         self.assertEqual(status, 502)
         self.assertEqual(json.loads(body)["error"]["type"], "proxy_error")
         line = self.line()
-        self.assertIn("retried=ConnectionRefusedError", line)
+        self.assertIn("retried=ConnectionRefusedError*3", line)
         self.assertIn("end=no_answer:ConnectionRefusedError", line)
 
     def test_json_answer_passes_through(self):
@@ -442,7 +448,7 @@ class NativeForward(Harness):
         self.assertIn("fallback=native_unrestored:400:bad_signature", line)
 
     def test_native_errors_reach_the_client_in_openai_shape(self):
-        Upstream.script = [(429, "application/json", [b'{"type":"error","error":{"type":"rate_limit_error","message":"slow"}}'])] * 2
+        Upstream.script = [(429, "application/json", [b'{"type":"error","error":{"type":"rate_limit_error","message":"slow"}}'])] * 4
         status, out = self.post(body=self.body())
         self.assertEqual((status, json.loads(out)["error"]["message"]), (429, "slow"))
 
